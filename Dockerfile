@@ -19,13 +19,14 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download whisperx and gigaam models (no auth needed)
+# Pre-download whisperx models directly from HuggingFace (no whisperx import needed)
 RUN python -c "\
-import whisperx; \
-whisperx.load_model('tiny', 'cpu', compute_type='float32'); \
-whisperx.load_model('large-v3', 'cpu', compute_type='float32'); \
+from huggingface_hub import snapshot_download; \
+snapshot_download('Systran/faster-whisper-tiny'); \
+snapshot_download('Systran/faster-whisper-large-v3'); \
 "
 
+# Pre-download GigaAM v3
 RUN python -c "\
 import gigaam; \
 gigaam.load_model('v3_e2e_rnnt'); \
