@@ -9,17 +9,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Fix torchvision/transformers version conflicts
-RUN pip install --no-cache-dir \
-    torchvision==0.17.0 \
-    transformers==4.39.3 \
-    --extra-index-url https://download.pytorch.org/whl/cu121
-
 # Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download whisperx models directly from HuggingFace (no whisperx import needed)
+# Pre-download whisperx models directly from HuggingFace (avoids import issues)
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('Systran/faster-whisper-tiny'); \
