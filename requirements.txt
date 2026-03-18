@@ -1,0 +1,8 @@
+runpod
+requests
+
+# WhisperX — faster-whisper + pyannote diarization + word alignment
+git+https://github.com/m-bain/whisperX.git
+
+# GigaAM v3 from Sber (Russian ASR)
+git+https://github.com/salute-developers/GigaAM.git
