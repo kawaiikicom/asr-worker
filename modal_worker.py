@@ -1,10 +1,6 @@
 """
 Modal Serverless Worker — Audio Transcription
 Dual-model: GigaAM v3 (Russian) + WhisperX large-v3 (all other languages)
-
-Deploy via GitHub Actions (push to main triggers auto-deploy).
-Requires secrets in Modal dashboard:
-  - hf-token  (HF_TOKEN)
 """
 
 import json
@@ -16,8 +12,29 @@ import modal
 
 app = modal.App("asr-worker")
 
+
 # ---------------------------------------------------------------------------
-# Image — all dependencies + pre-downloaded models
+# Model pre-download function (runs during image build)
+# ---------------------------------------------------------------------------
+
+def download_models():
+    from huggingface_hub import snapshot_download
+    import gigaam
+
+    print("Downloading faster-whisper-tiny...")
+    snapshot_download("Systran/faster-whisper-tiny")
+
+    print("Downloading faster-whisper-large-v3...")
+    snapshot_download("Systran/faster-whisper-large-v3")
+
+    print("Downloading GigaAM v3...")
+    gigaam.load_model("v3_e2e_rnnt")
+
+    print("All models downloaded.")
+
+
+# ---------------------------------------------------------------------------
+# Image — dependencies + pre-downloaded models baked in
 # ---------------------------------------------------------------------------
 
 image = (
@@ -25,45 +42,29 @@ image = (
     .apt_install("ffmpeg", "git")
     .pip_install(
         "requests",
+        "huggingface_hub",
         "git+https://github.com/m-bain/whisperX.git",
         "git+https://github.com/salute-developers/GigaAM.git",
         "pyannote.audio",
     )
+    .run_function(download_models)
 )
 
 
 # ---------------------------------------------------------------------------
-# Worker class — models loaded once per container
+# Worker class
 # ---------------------------------------------------------------------------
 
 @app.cls(
     gpu="A10G",
     image=image,
     secrets=[modal.Secret.from_name("hf-token")],
-    container_idle_timeout=300,
+    scaledown_window=300,
 )
 class ASRWorker:
 
-    @modal.build()
-    def download_models(self):
-        """Download model weights into image layers during build."""
-        from huggingface_hub import snapshot_download
-        import gigaam
-
-        print("Downloading faster-whisper-tiny...")
-        snapshot_download("Systran/faster-whisper-tiny")
-
-        print("Downloading faster-whisper-large-v3...")
-        snapshot_download("Systran/faster-whisper-large-v3")
-
-        print("Downloading GigaAM v3...")
-        gigaam.load_model("v3_e2e_rnnt")
-
-        print("All models downloaded.")
-
     @modal.enter()
     def load_models(self):
-        """Load models into GPU memory on cold start."""
         import os
         import torch
         import whisperx
@@ -76,7 +77,6 @@ class ASRWorker:
         hf_token = os.environ.get("HF_TOKEN", "")
 
         print(f"Device: {self.device}")
-
         print("Loading Whisper tiny...")
         self.tiny_model = whisperx.load_model("tiny", self.device, compute_type="float32")
 
@@ -92,19 +92,13 @@ class ASRWorker:
         if hf_token:
             try:
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                self.diarize_model = whisperx.DiarizationPipeline(
-                    use_auth_token=hf_token, device=self.device
-                )
+                self.diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=self.device)
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
         print("All models loaded. Worker ready.")
-
-    # -----------------------------------------------------------------------
-    # HTTP endpoint
-    # -----------------------------------------------------------------------
 
     @modal.web_endpoint(method="POST")
     def transcribe(self, request: dict) -> dict:
@@ -157,11 +151,7 @@ class ASRWorker:
             if audio_path and os.path.exists(audio_path):
                 os.unlink(audio_path)
 
-    # -----------------------------------------------------------------------
-    # Internal helpers
-    # -----------------------------------------------------------------------
-
-    def _download_audio(self, url: str) -> str:
+    def _download_audio(self, url):
         import requests
         clean_url = url.split("?")[0]
         ext = clean_url.rsplit(".", 1)[-1].lower()
@@ -176,7 +166,7 @@ class ASRWorker:
                     f.write(chunk)
         return tmp.name
 
-    def _get_duration(self, audio_path: str) -> float:
+    def _get_duration(self, audio_path):
         try:
             result = subprocess.run(
                 ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
@@ -187,7 +177,7 @@ class ASRWorker:
         except Exception:
             return 0.0
 
-    def _detect_language(self, audio_path: str) -> str:
+    def _detect_language(self, audio_path):
         import whisperx
         audio = whisperx.load_audio(audio_path)
         audio_30s = audio[:30 * 16000]
