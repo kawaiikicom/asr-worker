@@ -14,7 +14,7 @@ app = modal.App("asr-worker")
 
 
 # ---------------------------------------------------------------------------
-# Model pre-download function (runs during image build)
+# Model pre-download function (runs during image build on CPU)
 # ---------------------------------------------------------------------------
 
 def download_models():
@@ -48,7 +48,7 @@ image = (
         "git+https://github.com/salute-developers/GigaAM.git",
         "pyannote.audio",
     )
-    .run_function(download_models)
+    .run_function(download_models, cpu=2.0)
 )
 
 
