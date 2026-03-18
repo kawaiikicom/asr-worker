@@ -20,6 +20,7 @@ app = modal.App("asr-worker")
 def download_models():
     from huggingface_hub import snapshot_download
     import gigaam
+    import torch
 
     print("Downloading faster-whisper-tiny...")
     snapshot_download("Systran/faster-whisper-tiny")
@@ -29,6 +30,16 @@ def download_models():
 
     print("Downloading GigaAM v3...")
     gigaam.load_model("v3_e2e_rnnt")
+
+    # Pre-download alignment models for common languages
+    import whisperx
+    print("Downloading alignment models...")
+    for lang in ["en", "ru", "de", "fr", "es", "it", "zh", "ja", "ko", "pt"]:
+        try:
+            whisperx.load_align_model(language_code=lang, device="cpu")
+            print(f"  Alignment model: {lang}")
+        except Exception as e:
+            print(f"  Alignment model {lang} skipped: {e}")
 
     print("All models downloaded.")
 
@@ -205,13 +216,12 @@ class ASRWorker:
 
         if enable_diarization and self.diarize_model:
             try:
-                import torch
+                import torchaudio
                 kwargs = {}
                 if min_speakers > 1:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                import torchaudio
                 waveform, sample_rate = torchaudio.load(audio_path)
                 diarize_result = self.diarize_model({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
                 segments = self._assign_speakers(segments, diarize_result)
