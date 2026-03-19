@@ -51,7 +51,12 @@ image = (
         "requests",
         # huggingface_hub>=1.0 removed use_auth_token kwarg which pyannote 3.1.x uses internally
         "huggingface_hub<1.0",
+        # explicit transitive deps that bare CUDA image may miss:
+        # matplotlib <- pyannote.metrics; scipy/scikit-learn <- pyannote.metrics + speechbrain
         "matplotlib",
+        "scipy",
+        "scikit-learn",
+        "sentencepiece",
         "fastapi[standard]",
         "silero-vad",
         # pyannote 3.1.1: no torchcodec needed (3.3+ requires it)
