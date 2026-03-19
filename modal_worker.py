@@ -37,7 +37,7 @@ image = (
     )
     .pip_install(
         "requests",
-        "huggingface_hub>=0.20.0",
+        "huggingface_hub>=0.20.0,<1.0",
         "fastapi[standard]",
         "soundfile",
         "matplotlib",
