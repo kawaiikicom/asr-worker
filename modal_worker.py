@@ -104,6 +104,10 @@ class ASRWorker:
         print("Loading GigaAM v3...")
         import gigaam
         self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
+        # Explicitly move to GPU — gigaam.load_model() may default to CPU
+        if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
+            self.gigaam_model = self.gigaam_model.to(self.device)
+            print(f"GigaAM moved to {self.device}")
 
         # Load silero-vad (used for GigaAM speech segmentation, bypasses pyannote/torchcodec)
         print("Loading silero-vad...")
@@ -265,6 +269,7 @@ class ASRWorker:
             sampling_rate=16000,
             min_silence_duration_ms=500,
             min_speech_duration_ms=250,
+            max_speech_duration_s=20,  # GigaAM transcribe() limit is ~25s
             threshold=0.5,
         )
         print(f"Found {len(speech_timestamps)} speech segments")
