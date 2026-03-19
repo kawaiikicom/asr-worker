@@ -49,6 +49,8 @@ image = (
         "huggingface_hub",
         "fastapi[standard]",
         "silero-vad",
+        # numpy<2.0 required — pyannote 3.1.1 uses np.NaN removed in NumPy 2.0
+        "numpy<2.0",
         # pyannote 3.1.1 does NOT require torchcodec (that's 3.3+/4.x)
         "pyannote.audio==3.1.1",
         "git+https://github.com/salute-developers/GigaAM.git",
