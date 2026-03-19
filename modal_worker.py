@@ -1,6 +1,6 @@
 """
 Modal Serverless Worker — Russian Audio Transcription
-GigaAM v3 (Russian only) + pyannote speaker diarization
+GigaAM v3 (Russian) + pyannote speaker diarization
 
 Deploy:
   pip install modal
@@ -18,27 +18,30 @@ import modal
 
 app = modal.App("asr-worker")
 
+# Persistent volume for HF model cache — avoids re-downloading on every cold start
+volume = modal.Volume.from_name("asr-models-cache", create_if_missing=True)
+CACHE_DIR = "/vol/hf_cache"
 
 # ---------------------------------------------------------------------------
-# Model pre-download function (runs during image build on CPU)
+# Model pre-download function (runs during image build, populates volume)
 # ---------------------------------------------------------------------------
 
 def download_models():
-    from huggingface_hub import snapshot_download
+    os.environ["HF_HOME"] = CACHE_DIR
     import gigaam
+    from silero_vad import load_silero_vad
 
     print("Downloading GigaAM v3...")
     gigaam.load_model("v3_e2e_rnnt")
 
     print("Downloading silero-vad...")
-    from silero_vad import load_silero_vad
     load_silero_vad()
 
     print("All models downloaded.")
 
 
 # ---------------------------------------------------------------------------
-# Image — GigaAM + silero-vad + pyannote 3.1.1 (no WhisperX, no torchcodec)
+# Image — GigaAM + silero-vad + pyannote 3.1.1
 # ---------------------------------------------------------------------------
 
 image = (
@@ -49,11 +52,12 @@ image = (
         "huggingface_hub",
         "fastapi[standard]",
         "silero-vad",
-        # pyannote 3.2.x: numpy 2.0 compatible (np.NaN fixed), no torchcodec needed
-        "pyannote.audio==3.2.0",
+        # pyannote 3.1.1: no torchcodec needed (3.3+ requires it)
+        # np.NaN issue with numpy 2.0 is patched at runtime before import
+        "pyannote.audio==3.1.1",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
-    .run_function(download_models, cpu=2.0)
+    .run_function(download_models, cpu=2.0, volumes={CACHE_DIR: volume})
 )
 
 
@@ -65,6 +69,7 @@ image = (
     gpu="L4",
     image=image,
     secrets=[modal.Secret.from_name("hf-token")],
+    volumes={CACHE_DIR: volume},
     scaledown_window=10,
     timeout=3600,
 )
@@ -73,10 +78,18 @@ class ASRWorker:
     @modal.enter()
     def load_models(self):
         import torch
+
+        # Patch numpy 2.0 compatibility — pyannote 3.1.x uses np.NaN
+        # which was removed in numpy 2.0 (required by GigaAM)
+        import numpy as np
+        if not hasattr(np, 'NaN'):
+            np.NaN = np.nan
+
         from pyannote.audio import Pipeline
         from silero_vad import load_silero_vad
         import gigaam
 
+        os.environ["HF_HOME"] = CACHE_DIR
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
@@ -243,7 +256,7 @@ class ASRWorker:
                 if os.path.exists(wav_path):
                     os.unlink(wav_path)
                 segments = self._assign_speakers(segments, diarize_result)
-                print(f"Diarization complete.")
+                print("Diarization complete.")
             except Exception as e:
                 print(f"Diarization failed: {e}")
         elif enable_diarization:
