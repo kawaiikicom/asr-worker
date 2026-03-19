@@ -48,26 +48,14 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
     .pip_install(
-        # torch 2.6 changed weights_only=True by default in torch.load, breaking pyannote checkpoints
-        "torch==2.5.1",
-        "torchaudio==2.5.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .pip_install(
         "requests",
-        # huggingface_hub>=1.0 removed use_auth_token kwarg which pyannote 3.1.x uses internally
-        "huggingface_hub<1.0",
-        # explicit transitive deps that bare CUDA image may miss:
-        # matplotlib <- pyannote.metrics; scipy/scikit-learn <- pyannote.metrics + speechbrain
-        "matplotlib",
-        "scipy",
-        "scikit-learn",
-        "sentencepiece",
+        "huggingface_hub>=0.20.0",
         "fastapi[standard]",
         "silero-vad",
-        # pyannote 3.1.1: no torchcodec needed (3.3+ requires it)
-        # np.NaN issue with numpy 2.0 is patched at runtime before import
-        "pyannote.audio==3.1.1",
+        # миррор DialogScribe (yaruslove/DialogScribe) — рабочая сборка GigaAM + pyannote
+        "pyannote.audio>=3.1.0",
+        "speechbrain>=1.0.0",
+        "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
     .run_function(download_models, cpu=2.0, volumes={CACHE_DIR: volume})
@@ -91,13 +79,6 @@ class ASRWorker:
     @modal.enter()
     def load_models(self):
         import torch
-
-        # Patch numpy 2.0 compatibility — pyannote 3.1.x uses np.NaN
-        # which was removed in numpy 2.0 (required by GigaAM)
-        import numpy as np
-        if not hasattr(np, 'NaN'):
-            np.NaN = np.nan
-
 
         from pyannote.audio import Pipeline
         from silero_vad import load_silero_vad
@@ -126,11 +107,9 @@ class ASRWorker:
         if hf_token:
             try:
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                # Set token via env — pyannote 3.1.x doesn't accept token= kwarg
-                # and huggingface_hub removed use_auth_token=. Env var works for both.
-                os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
                 self.diarize_model = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
+                    token=hf_token,
                 ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
