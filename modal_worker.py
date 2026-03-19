@@ -48,6 +48,10 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
     .pip_install(
+        "torchcodec>=0.6.0",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
         "requests",
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
