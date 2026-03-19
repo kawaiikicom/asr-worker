@@ -49,10 +49,8 @@ image = (
         "huggingface_hub",
         "fastapi[standard]",
         "silero-vad",
-        # numpy<2.0 required — pyannote 3.1.1 uses np.NaN removed in NumPy 2.0
-        "numpy<2.0",
-        # pyannote 3.1.1 does NOT require torchcodec (that's 3.3+/4.x)
-        "pyannote.audio==3.1.1",
+        # pyannote 3.2.x: numpy 2.0 compatible (np.NaN fixed), no torchcodec needed
+        "pyannote.audio==3.2.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
     .run_function(download_models, cpu=2.0)
