@@ -112,9 +112,11 @@ class ASRWorker:
         if hf_token:
             try:
                 os.environ["HF_HUB_OFFLINE"] = "0"
+                # Set token via env — pyannote 3.1.x doesn't accept token= kwarg
+                # and huggingface_hub removed use_auth_token=. Env var works for both.
+                os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
                 self.diarize_model = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    token=hf_token,
                 ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
