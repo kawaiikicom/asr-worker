@@ -61,8 +61,8 @@ image = (
         "huggingface_hub",
         "fastapi[standard]",
         "silero-vad",
-        # torchcodec required by pyannote>=3.3 (AudioDecoder was moved here from torchaudio)
-        "torchcodec==0.1",
+        # torchcodec required by pyannote>=4.0 (AudioDecoder was moved here from torchaudio)
+        "torchcodec",
         "git+https://github.com/m-bain/whisperX.git",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
