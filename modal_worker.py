@@ -62,6 +62,7 @@ image = (
     volumes={CACHE_DIR: volume},
     scaledown_window=10,
     timeout=3600,
+    enable_memory_snapshot=True,
 )
 class ASRWorker:
 
