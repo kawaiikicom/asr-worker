@@ -114,7 +114,7 @@ class ASRWorker:
                 os.environ["HF_HUB_OFFLINE"] = "0"
                 self.diarize_model = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token,
+                    token=hf_token,
                 ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
