@@ -103,11 +103,14 @@ class ASRWorker:
         self.diarize_model = None
         if hf_token:
             try:
+                from torch.torch_version import TorchVersion
+                from pyannote.audio.core.task import Problem, Resolution, Specifications
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                self.diarize_model = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token,
-                ).to(torch.device(self.device))
+                with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
+                    self.diarize_model = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        use_auth_token=hf_token,
+                    ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
             except Exception as e:
@@ -181,8 +184,20 @@ class ASRWorker:
             return 0.0
 
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
+        # soundfile (pyannote backend) doesn't support m4a/mp4 — convert to wav first
+        wav_path = audio_path + ".wav"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
+            capture_output=True,
+        )
+        input_path = wav_path if os.path.exists(wav_path) else audio_path
+
         print("Running GigaAM transcribe_longform...")
-        utterances = self.gigaam_model.transcribe_longform(audio_path)
+        try:
+            utterances = self.gigaam_model.transcribe_longform(input_path)
+        finally:
+            if os.path.exists(wav_path):
+                os.unlink(wav_path)
 
         segments = []
         for utt in utterances:
