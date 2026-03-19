@@ -58,7 +58,7 @@ image = (
         "fastapi[standard]",
         "git+https://github.com/m-bain/whisperX.git",
         "git+https://github.com/salute-developers/GigaAM.git",
-        "pyannote.audio",
+        "pyannote.audio==3.1.1",  # pin to avoid torchcodec dependency (broken in this env)
     )
     .run_function(download_models, cpu=2.0)
 )
@@ -108,7 +108,7 @@ class ASRWorker:
                 os.environ["HF_HUB_OFFLINE"] = "0"
                 self.diarize_model = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token,
+                    use_auth_token=hf_token,  # pyannote 3.1.1 uses use_auth_token
                 ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
