@@ -23,20 +23,6 @@ volume = modal.Volume.from_name("asr-models-cache", create_if_missing=True)
 CACHE_DIR = "/vol/hf_cache"
 
 # ---------------------------------------------------------------------------
-# Model pre-download function (runs during image build, populates volume)
-# ---------------------------------------------------------------------------
-
-def download_models():
-    os.environ["HF_HOME"] = CACHE_DIR
-    import gigaam
-
-    print("Downloading GigaAM v3...")
-    gigaam.load_model("v3_e2e_rnnt")
-
-    print("All models downloaded.")
-
-
-# ---------------------------------------------------------------------------
 # Image — GigaAM + pyannote
 # ---------------------------------------------------------------------------
 
@@ -58,7 +44,6 @@ image = (
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
-    .run_function(download_models, cpu=2.0, volumes={CACHE_DIR: volume})
 )
 
 
@@ -85,6 +70,8 @@ class ASRWorker:
         os.environ["HF_HOME"] = CACHE_DIR
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        # GigaAM хранит веса в torch.hub dir — направляем в volume
+        torch.hub.set_dir(CACHE_DIR)
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         hf_token = os.environ.get("HF_TOKEN", "")
