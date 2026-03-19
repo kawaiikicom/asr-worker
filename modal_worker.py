@@ -29,19 +29,15 @@ CACHE_DIR = "/vol/hf_cache"
 def download_models():
     os.environ["HF_HOME"] = CACHE_DIR
     import gigaam
-    from silero_vad import load_silero_vad
 
     print("Downloading GigaAM v3...")
     gigaam.load_model("v3_e2e_rnnt")
-
-    print("Downloading silero-vad...")
-    load_silero_vad()
 
     print("All models downloaded.")
 
 
 # ---------------------------------------------------------------------------
-# Image — GigaAM + silero-vad + pyannote 3.1.1
+# Image — GigaAM + pyannote
 # ---------------------------------------------------------------------------
 
 image = (
@@ -51,8 +47,7 @@ image = (
         "requests",
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
-        "silero-vad",
-        # <3.3 чтобы не тянуть torchcodec (как у DialogScribe)
+        # <3.3 чтобы не тянуть torchcodec
         "pyannote.audio>=3.1.0,<3.3",
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
@@ -79,9 +74,7 @@ class ASRWorker:
     @modal.enter()
     def load_models(self):
         import torch
-
         from pyannote.audio import Pipeline
-        from silero_vad import load_silero_vad
         import gigaam
 
         os.environ["HF_HOME"] = CACHE_DIR
@@ -98,9 +91,6 @@ class ASRWorker:
         if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
             self.gigaam_model = self.gigaam_model.to(self.device)
             print(f"GigaAM moved to {self.device}")
-
-        print("Loading silero-vad...")
-        self.silero_vad = load_silero_vad()
 
         print("Loading pyannote diarization...")
         self.diarize_model = None
@@ -184,53 +174,15 @@ class ASRWorker:
             return 0.0
 
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
-        import torchaudio
-        from silero_vad import read_audio, get_speech_timestamps
-
-        waveform = read_audio(audio_path)
-
-        print(f"Running silero-vad on {len(waveform) / 16000:.1f}s of audio...")
-        speech_timestamps = get_speech_timestamps(
-            waveform,
-            self.silero_vad,
-            sampling_rate=16000,
-            min_silence_duration_ms=500,
-            min_speech_duration_ms=250,
-            max_speech_duration_s=20,
-            threshold=0.5,
-        )
-        print(f"Found {len(speech_timestamps)} speech segments")
+        print("Running GigaAM transcribe_longform...")
+        utterances = self.gigaam_model.transcribe_longform(audio_path)
 
         segments = []
-        chunk_paths = []
-
-        try:
-            for ts in speech_timestamps:
-                start_sample = ts["start"]
-                end_sample = ts["end"]
-                chunk = waveform[start_sample:end_sample].unsqueeze(0)
-                if chunk.shape[1] < 800:
-                    continue
-
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                tmp.close()
-                chunk_paths.append(tmp.name)
-                torchaudio.save(tmp.name, chunk, 16000, format="wav")
-
-                try:
-                    text = self.gigaam_model.transcribe(tmp.name)
-                    if text and text.strip():
-                        segments.append({
-                            "start": float(start_sample / 16000.0),
-                            "end": float(end_sample / 16000.0),
-                            "text": text.strip(),
-                        })
-                except Exception as e:
-                    print(f"GigaAM chunk error at {start_sample / 16000:.1f}s: {e}")
-        finally:
-            for p in chunk_paths:
-                if os.path.exists(p):
-                    os.unlink(p)
+        for utt in utterances:
+            text = utt["transcription"].strip()
+            start, end = utt["boundaries"]
+            if text:
+                segments.append({"start": float(start), "end": float(end), "text": text})
 
         print(f"GigaAM transcribed {len(segments)} segments")
 
