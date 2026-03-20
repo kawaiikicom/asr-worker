@@ -27,6 +27,7 @@ image = (
     .pip_install(
         "faster-whisper==1.1.1",
         "huggingface_hub>=0.20.0,<1.0",
+        "fastapi[standard]",
     )
 )
 
