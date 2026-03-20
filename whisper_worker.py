@@ -26,8 +26,8 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
     .pip_install(
-        "torch==2.4.1",
-        "torchaudio==2.4.1",
+        "torch==2.8.0",
+        "torchaudio==2.8.0",
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
@@ -89,10 +89,15 @@ class WhisperWorker:
         self.diarize_model = None
         if hf_token:
             try:
+                from contextlib import nullcontext
                 from torch.torch_version import TorchVersion
                 from pyannote.audio.core.task import Problem, Resolution, Specifications
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
+                if hasattr(torch.serialization, "safe_globals"):
+                    ctx = torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution])
+                else:
+                    ctx = nullcontext()
+                with ctx:
                     self.diarize_model = Pipeline.from_pretrained(
                         "pyannote/speaker-diarization-3.1",
                         use_auth_token=hf_token,
