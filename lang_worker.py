@@ -39,7 +39,7 @@ image = (
 @app.cls(
     image=image,
     volumes={CACHE_DIR: volume},
-    scaledown_window=10,
+    scaledown_window=1,
     timeout=120,
     enable_memory_snapshot=True,
 )

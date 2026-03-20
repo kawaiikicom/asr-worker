@@ -55,7 +55,7 @@ image = (
     image=image,
     secrets=[modal.Secret.from_name("hf-token")],
     volumes={CACHE_DIR: volume},
-    scaledown_window=10,
+    scaledown_window=1,
     timeout=3600,
     enable_memory_snapshot=True,
 )
