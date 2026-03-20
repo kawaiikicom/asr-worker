@@ -18,6 +18,42 @@ app = modal.App("whisper-worker")
 volume = modal.Volume.from_name("asr-models-cache", create_if_missing=True)
 CACHE_DIR = "/vol/hf_cache"
 
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+
+def _validate_url(url: str) -> None:
+    """Raise ValueError if URL is unsafe (SSRF prevention)."""
+    import urllib.parse
+    import ipaddress
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("URL missing host")
+    if host in ("localhost", "::1"):
+        raise ValueError(f"Blocked host: {host}")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # domain name — allowed
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        raise ValueError(f"Blocked private address: {host}")
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _guess_suffix(url: str) -> str:
+    path = url.split("?")[0]
+    ext = os.path.splitext(path)[1]
+    return ext if ext else ".audio"
+
+
 # ---------------------------------------------------------------------------
 # Image
 # ---------------------------------------------------------------------------
@@ -53,7 +89,10 @@ image = (
 @app.cls(
     gpu="L4",
     image=image,
-    secrets=[modal.Secret.from_name("hf-token")],
+    secrets=[
+        modal.Secret.from_name("hf-token"),
+        modal.Secret.from_name("worker-auth-token", required=False),
+    ],
     volumes={CACHE_DIR: volume},
     scaledown_window=1,
     timeout=3600,
@@ -67,6 +106,8 @@ class WhisperWorker:
         from faster_whisper import WhisperModel
         from pyannote.audio import Pipeline
 
+        self._load_error = None
+
         os.environ["HF_HOME"] = CACHE_DIR
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -77,13 +118,18 @@ class WhisperWorker:
         print(f"Device: {self.device}")
 
         print("Loading Whisper large-v3-turbo...")
-        self.whisper_model = WhisperModel(
-            "large-v3-turbo",
-            device=self.device,
-            compute_type="float16" if self.device == "cuda" else "int8",
-            download_root=os.path.join(CACHE_DIR, "whisper"),
-        )
-        print("Whisper loaded.")
+        try:
+            self.whisper_model = WhisperModel(
+                "large-v3-turbo",
+                device=self.device,
+                compute_type="float16" if self.device == "cuda" else "int8",
+                download_root=os.path.join(CACHE_DIR, "whisper"),
+            )
+            print("Whisper loaded.")
+        except Exception as e:
+            self._load_error = f"{type(e).__name__}: {e}"
+            print(f"FATAL: Whisper failed to load:\n{traceback.format_exc()}")
+            return  # skip diarization loading too
 
         print("Loading pyannote diarization...")
         self.diarize_model = None
@@ -93,17 +139,19 @@ class WhisperWorker:
                 from torch.torch_version import TorchVersion
                 from pyannote.audio.core.task import Problem, Resolution, Specifications
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                if hasattr(torch.serialization, "safe_globals"):
-                    ctx = torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution])
-                else:
-                    ctx = nullcontext()
-                with ctx:
-                    self.diarize_model = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.1",
-                        use_auth_token=hf_token,
-                    ).to(torch.device(self.device))
-                os.environ["HF_HUB_OFFLINE"] = "1"
-                print("Diarization model loaded.")
+                try:
+                    if hasattr(torch.serialization, "safe_globals"):
+                        ctx = torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution])
+                    else:
+                        ctx = nullcontext()
+                    with ctx:
+                        self.diarize_model = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            use_auth_token=hf_token,
+                        ).to(torch.device(self.device))
+                    print("Diarization model loaded.")
+                finally:
+                    os.environ["HF_HUB_OFFLINE"] = "1"
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
@@ -111,14 +159,26 @@ class WhisperWorker:
 
     @modal.fastapi_endpoint(method="POST")
     def transcribe(self, request: dict) -> dict:
+        if getattr(self, "_load_error", None):
+            return {"error": f"Worker initialization failed: {self._load_error}"}
+
         audio_url = request.get("audio_url")
         language = request.get("language")  # None = auto-detect
         enable_diarization = request.get("enable_diarization", True)
-        min_speakers = int(request.get("min_speakers", 1))
-        max_speakers = int(request.get("max_speakers", 10))
+        min_speakers = _safe_int(request.get("min_speakers", 1), 1)
+        max_speakers = _safe_int(request.get("max_speakers", 10), 10)
+
+        worker_token = os.environ.get("WORKER_AUTH_TOKEN", "")
+        if worker_token and request.get("auth_token") != worker_token:
+            return {"error": "Unauthorized"}
 
         if not audio_url:
             return {"error": "audio_url is required"}
+
+        try:
+            _validate_url(audio_url)
+        except ValueError as e:
+            return {"error": str(e)}
 
         tmp_path = None
         wav_path = None
@@ -135,27 +195,32 @@ class WhisperWorker:
             if dl.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
                 return {"error": f"Download failed: {dl.stderr.decode()[:300]}"}
 
+            if os.path.getsize(tmp_path) > MAX_DOWNLOAD_BYTES:
+                return {"error": f"Audio file exceeds {MAX_DOWNLOAD_BYTES // (1024 ** 3)} GB limit"}
+
             # Конвертируем в WAV 16kHz (faster-whisper требует)
             wav_path = tmp_path + ".wav"
-            subprocess.run(
+            conv = subprocess.run(
                 ["ffmpeg", "-y", "-i", tmp_path, "-ar", "16000", "-ac", "1", wav_path],
                 capture_output=True,
             )
-            input_path = wav_path if os.path.exists(wav_path) else tmp_path
+            if conv.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
+                raise RuntimeError(f"WAV conversion failed: {conv.stderr.decode()[:300]}")
 
             return self._run_whisper(
-                input_path, language, enable_diarization, min_speakers, max_speakers
+                wav_path, language, enable_diarization, min_speakers, max_speakers
             )
 
         except Exception as e:
-            return {"error": str(e), "traceback": traceback.format_exc()}
+            print(traceback.format_exc())
+            return {"error": str(e)}
         finally:
             for p in (tmp_path, wav_path):
                 if p and os.path.exists(p):
                     try:
                         os.unlink(p)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        print(f"Warning: failed to delete temp file {p}: {exc}")
 
     def _run_whisper(self, audio_path, language, enable_diarization, min_speakers, max_speakers):
         import concurrent.futures
@@ -175,8 +240,15 @@ class WhisperWorker:
 
             if diarize_result is not None and segments:
                 segments = self._merge_speakers(segments, diarize_result)
+            else:
+                for seg in segments:
+                    seg["speaker"] = "SPEAKER_00"
         else:
             segments, detected_language, duration = self._transcribe(audio_path, lang_arg)
+            if enable_diarization:
+                # Diarization was requested but model not available
+                for seg in segments:
+                    seg["speaker"] = "SPEAKER_00"
 
         return self._build_response(segments, detected_language, duration)
 
@@ -217,19 +289,19 @@ class WhisperWorker:
             print("Diarization done.")
             return result
         except Exception as e:
-            print(f"Diarization failed: {e}")
+            print(f"Diarization failed ({type(e).__name__}): {e}")
             return None
-
-    def _assign_speakers(self, segments, audio_path, min_speakers, max_speakers):
-        diarize_result = self._diarize(audio_path, min_speakers, max_speakers)
-        if diarize_result is None:
-            return segments
-        return self._merge_speakers(segments, diarize_result)
 
     def _merge_speakers(self, segments, diarize_result):
         speaker_turns = []
-        for turn, _, speaker in diarize_result.itertracks(yield_label=True):
-            speaker_turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+        try:
+            for turn, _, speaker in diarize_result.itertracks(yield_label=True):
+                speaker_turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+        except Exception as e:
+            print(f"Speaker merge failed (itertracks): {e} — assigning SPEAKER_00 to all segments")
+            for seg in segments:
+                seg["speaker"] = "SPEAKER_00"
+            return segments
 
         for seg in segments:
             seg_start, seg_end = seg["start"], seg["end"]
@@ -259,22 +331,8 @@ class WhisperWorker:
         raw_text = " ".join(s["text"] for s in segments)
         word_count = len(raw_text.split()) if raw_text else 0
 
-        # Форматированный текст со спикерами
-        formatted_parts = []
-        prev_speaker = None
-        for seg in segments:
-            speaker = seg.get("speaker")
-            if speaker:
-                label = self._fmt_speaker(speaker)
-                if speaker != prev_speaker:
-                    formatted_parts.append(f"\n**{label}:** {seg['text']}")
-                    prev_speaker = speaker
-                else:
-                    formatted_parts.append(seg["text"])
-            else:
-                formatted_parts.append(seg["text"])
-
-        formatted_text = " ".join(formatted_parts).strip() if formatted_parts else raw_text
+        has_speakers = any(seg.get("speaker") for seg in segments)
+        formatted_text = self._build_formatted_text(segments) if has_speakers else raw_text
 
         return {
             "text": raw_text,
@@ -285,6 +343,23 @@ class WhisperWorker:
             "word_count": word_count,
         }
 
+    def _build_formatted_text(self, segments):
+        lines, current_speaker, current_texts = [], None, []
+        for seg in segments:
+            speaker = seg.get("speaker") or "SPEAKER_00"
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+            if speaker != current_speaker:
+                if current_speaker and current_texts:
+                    lines.append(f"**{self._fmt_speaker(current_speaker)}:** {' '.join(current_texts)}")
+                current_speaker, current_texts = speaker, [text]
+            else:
+                current_texts.append(text)
+        if current_speaker and current_texts:
+            lines.append(f"**{self._fmt_speaker(current_speaker)}:** {' '.join(current_texts)}")
+        return "\n\n".join(lines)
+
     def _fmt_speaker(self, speaker_id):
         if speaker_id.startswith("SPEAKER_"):
             try:
@@ -293,9 +368,3 @@ class WhisperWorker:
             except ValueError:
                 pass
         return speaker_id
-
-
-def _guess_suffix(url: str) -> str:
-    path = url.split("?")[0]
-    ext = os.path.splitext(path)[1]
-    return ext if ext else ".audio"

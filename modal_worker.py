@@ -22,6 +22,36 @@ app = modal.App("asr-worker")
 volume = modal.Volume.from_name("asr-models-cache", create_if_missing=True)
 CACHE_DIR = "/vol/hf_cache"
 
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+
+def _validate_url(url: str) -> None:
+    """Raise ValueError if URL is unsafe (SSRF prevention)."""
+    import urllib.parse
+    import ipaddress
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("URL missing host")
+    if host in ("localhost", "::1"):
+        raise ValueError(f"Blocked host: {host}")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # domain name — allowed
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        raise ValueError(f"Blocked private address: {host}")
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Image — GigaAM + pyannote
 # ---------------------------------------------------------------------------
@@ -58,7 +88,10 @@ image = (
 @app.cls(
     gpu="L4",
     image=image,
-    secrets=[modal.Secret.from_name("hf-token")],
+    secrets=[
+        modal.Secret.from_name("hf-token"),
+        modal.Secret.from_name("worker-auth-token", required=False),
+    ],
     volumes={CACHE_DIR: volume},
     scaledown_window=1,
     timeout=3600,
@@ -71,6 +104,8 @@ class ASRWorker:
         import torch
         from pyannote.audio import Pipeline
         import gigaam
+
+        self._load_error = None
 
         os.environ["HF_HOME"] = CACHE_DIR
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -95,10 +130,15 @@ class ASRWorker:
         _vad.load_segmentation_model = _patched_load_segmentation_model
 
         print("Loading GigaAM v3...")
-        self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
-        if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
-            self.gigaam_model = self.gigaam_model.to(self.device)
-            print(f"GigaAM moved to {self.device}")
+        try:
+            self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
+            if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
+                self.gigaam_model = self.gigaam_model.to(self.device)
+                print(f"GigaAM moved to {self.device}")
+        except Exception as e:
+            self._load_error = f"{type(e).__name__}: {e}"
+            print(f"FATAL: GigaAM failed to load:\n{traceback.format_exc()}")
+            return  # skip diarization loading too
 
         print("Loading pyannote diarization...")
         self.diarize_model = None
@@ -107,13 +147,15 @@ class ASRWorker:
                 from torch.torch_version import TorchVersion
                 from pyannote.audio.core.task import Problem, Resolution, Specifications
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
-                    self.diarize_model = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.1",
-                        use_auth_token=hf_token,
-                    ).to(torch.device(self.device))
-                os.environ["HF_HUB_OFFLINE"] = "1"
-                print("Diarization model loaded.")
+                try:
+                    with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
+                        self.diarize_model = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            use_auth_token=hf_token,
+                        ).to(torch.device(self.device))
+                    print("Diarization model loaded.")
+                finally:
+                    os.environ["HF_HUB_OFFLINE"] = "1"
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
@@ -121,13 +163,25 @@ class ASRWorker:
 
     @modal.fastapi_endpoint(method="POST")
     def transcribe(self, request: dict) -> dict:
+        if getattr(self, "_load_error", None):
+            return {"error": f"Worker initialization failed: {self._load_error}"}
+
         audio_url = request.get("audio_url")
         enable_diarization = request.get("enable_diarization", True)
-        min_speakers = int(request.get("min_speakers", 1))
-        max_speakers = int(request.get("max_speakers", 4))
+        min_speakers = _safe_int(request.get("min_speakers", 1), 1)
+        max_speakers = _safe_int(request.get("max_speakers", 4), 4)
+
+        worker_token = os.environ.get("WORKER_AUTH_TOKEN", "")
+        if worker_token and request.get("auth_token") != worker_token:
+            return {"error": "Unauthorized"}
 
         if not audio_url:
             return {"error": "audio_url is required"}
+
+        try:
+            _validate_url(audio_url)
+        except ValueError as e:
+            return {"error": str(e)}
 
         audio_path = None
         try:
@@ -152,11 +206,14 @@ class ASRWorker:
 
         except Exception as e:
             print(traceback.format_exc())
-            return {"error": str(e), "traceback": traceback.format_exc()}
+            return {"error": str(e)}
 
         finally:
             if audio_path and os.path.exists(audio_path):
-                os.unlink(audio_path)
+                try:
+                    os.unlink(audio_path)
+                except Exception as exc:
+                    print(f"Warning: failed to delete temp file {audio_path}: {exc}")
 
     def _download_audio(self, url):
         import requests
@@ -168,8 +225,12 @@ class ASRWorker:
         tmp.close()
         with requests.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
+            total = 0
             with open(tmp.name, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise ValueError(f"Audio file exceeds {MAX_DOWNLOAD_BYTES // (1024 ** 3)} GB limit")
                     f.write(chunk)
         return tmp.name
 
@@ -181,7 +242,8 @@ class ASRWorker:
             )
             data = json.loads(result.stdout)
             return float(data["format"]["duration"])
-        except Exception:
+        except Exception as e:
+            print(f"Warning: could not get audio duration: {e}")
             return 0.0
 
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
@@ -189,17 +251,18 @@ class ASRWorker:
 
         # Конвертируем один раз — используется и GigaAM, и pyannote
         wav_path = audio_path + ".wav"
-        subprocess.run(
+        conv = subprocess.run(
             ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
             capture_output=True,
         )
-        input_path = wav_path if os.path.exists(wav_path) else audio_path
+        if conv.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
+            raise RuntimeError(f"ffmpeg WAV conversion failed: {conv.stderr.decode()[:300]}")
 
         try:
             if enable_diarization and self.diarize_model:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                    transcribe_future = executor.submit(self._transcribe, input_path)
-                    diarize_future = executor.submit(self._diarize, input_path, min_speakers, max_speakers)
+                    transcribe_future = executor.submit(self._transcribe, wav_path)
+                    diarize_future = executor.submit(self._diarize, wav_path, min_speakers, max_speakers)
 
                     segments = transcribe_future.result()
                     diarize_result = diarize_future.result()
@@ -210,13 +273,15 @@ class ASRWorker:
                     for seg in segments:
                         seg["speaker"] = "SPEAKER_00"
             else:
-                segments = self._transcribe(input_path)
+                segments = self._transcribe(wav_path)
                 if enable_diarization:
                     for seg in segments:
                         seg["speaker"] = "SPEAKER_00"
         finally:
-            if os.path.exists(wav_path):
+            try:
                 os.unlink(wav_path)
+            except Exception as exc:
+                print(f"Warning: failed to delete wav file {wav_path}: {exc}")
 
         return segments
 
@@ -244,7 +309,7 @@ class ASRWorker:
             print("Diarization done.")
             return result
         except Exception as e:
-            print(f"Diarization failed: {e}")
+            print(f"Diarization failed ({type(e).__name__}): {e}")
             return None
 
     def _assign_speakers(self, segments, diarize_result):
@@ -253,7 +318,9 @@ class ASRWorker:
             for turn, _, speaker in diarize_result.itertracks(yield_label=True):
                 speaker_turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
         except Exception as e:
-            print(f"Could not parse diarization result: {e}")
+            print(f"Could not parse diarization result: {e} — assigning SPEAKER_00 to all segments")
+            for seg in segments:
+                seg["speaker"] = "SPEAKER_00"
             return segments
 
         for seg in segments:
