@@ -158,18 +158,34 @@ class WhisperWorker:
                         pass
 
     def _run_whisper(self, audio_path, language, enable_diarization, min_speakers, max_speakers):
-        import torch
+        import concurrent.futures
 
         print(f"Running Whisper large-v3-turbo (language={language or 'auto'})...")
 
-        # language=None → auto-detect
         lang_arg = language if language and language != "auto" else None
 
+        if enable_diarization and self.diarize_model:
+            # Запускаем транскрипцию и диаризацию параллельно
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                whisper_future = executor.submit(self._transcribe, audio_path, lang_arg)
+                diarize_future = executor.submit(self._diarize, audio_path, min_speakers, max_speakers)
+
+                segments, detected_language, duration = whisper_future.result()
+                diarize_result = diarize_future.result()
+
+            if diarize_result is not None and segments:
+                segments = self._merge_speakers(segments, diarize_result)
+        else:
+            segments, detected_language, duration = self._transcribe(audio_path, lang_arg)
+
+        return self._build_response(segments, detected_language, duration)
+
+    def _transcribe(self, audio_path, lang_arg):
         segments_iter, info = self.whisper_model.transcribe(
             audio_path,
             language=lang_arg,
             beam_size=5,
-            vad_filter=True,             # встроенный VAD — убирает тишину
+            vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
         )
 
@@ -183,33 +199,34 @@ class WhisperWorker:
                     "text": text,
                 })
 
-        detected_language = info.language or (language or "unknown")
+        detected_language = info.language or "unknown"
         duration = float(info.duration) if info.duration else (
             segments[-1]["end"] if segments else 0.0
         )
-
         print(f"Whisper done: {len(segments)} segments, language={detected_language}")
+        return segments, detected_language, duration
 
-        # Диаризация
-        if enable_diarization and self.diarize_model and segments:
-            segments = self._assign_speakers(segments, audio_path, min_speakers, max_speakers)
-
-        return self._build_response(segments, detected_language, duration)
-
-    def _assign_speakers(self, segments, audio_path, min_speakers, max_speakers):
-        import torch
-
+    def _diarize(self, audio_path, min_speakers, max_speakers):
         print("Running diarization...")
         try:
-            diarize_result = self.diarize_model(
+            result = self.diarize_model(
                 audio_path,
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
             )
+            print("Diarization done.")
+            return result
         except Exception as e:
             print(f"Diarization failed: {e}")
-            return segments
+            return None
 
+    def _assign_speakers(self, segments, audio_path, min_speakers, max_speakers):
+        diarize_result = self._diarize(audio_path, min_speakers, max_speakers)
+        if diarize_result is None:
+            return segments
+        return self._merge_speakers(segments, diarize_result)
+
+    def _merge_speakers(self, segments, diarize_result):
         speaker_turns = []
         for turn, _, speaker in diarize_result.itertracks(yield_label=True):
             speaker_turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
@@ -235,7 +252,7 @@ class WhisperWorker:
             if sp in speaker_order:
                 seg["speaker"] = f"SPEAKER_{speaker_order[sp]:02d}"
 
-        print(f"Diarization done: {len(speaker_order)} speakers")
+        print(f"Speakers merged: {len(speaker_order)} speakers")
         return segments
 
     def _build_response(self, segments, language, duration):
