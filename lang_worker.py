@@ -41,6 +41,7 @@ image = (
     volumes={CACHE_DIR: volume},
     scaledown_window=60,
     timeout=120,
+    enable_memory_snapshot=True,
 )
 class LangWorker:
 
