@@ -31,8 +31,8 @@ image = (
     .apt_install("ffmpeg", "git")
     # torch первым — чтобы torchcodec (dep pyannote 3.3) нашёл правильные CUDA-колёса
     .pip_install(
-        "torch==2.3.1",
-        "torchaudio==2.3.1",
+        "torch",
+        "torchaudio",
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
